@@ -1,0 +1,3 @@
+CSTR VCTK Corpus v0.92. Junichi Yamagishi, Christophe Veaux, Kirsten MacDonald, 2019. University of Edinburgh CSTR. DOI: https://doi.org/10.7488/ds/2645 . Representation: https://huggingface.co/datasets/kth-tmh/vctk . CC BY 4.0: https://creativecommons.org/licenses/by/4.0/ . Four mic1 excerpts redistributed unmodified; the experiment resamples to 16 kHz. Accent labels are dataset metadata, not independently assessed. Metadata contains reference texts and source row indices. No model outputs are included.
+
+Baseline recordings: LibriSpeech/OpenSLR via openslr/librispeech_asr, CC BY 4.0, https://huggingface.co/datasets/openslr/librispeech_asr . Noisy versions are derived by adding synthetic white noise at 10 dB SNR. Preserve source attribution.

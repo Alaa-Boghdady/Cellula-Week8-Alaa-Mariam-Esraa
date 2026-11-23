@@ -1,0 +1,149 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{amsmath,amssymb,booktabs,url}
+\usepackage[hidelinks]{hyperref}
+\title{Kimi K2 Architecture: Sparse Capacity, Latent Attention, and Stable Agentic Training}
+\author{\IEEEauthorblockN{Alaa Boghdady}\IEEEauthorblockA{Cellula AI Internship -- Week 8, Task 0}}
+\begin{document}
+\maketitle
+\begin{abstract}
+Kimi K2 separates model capacity from per-token computation through a large mixture-of-experts network and compresses attention state through multi-head latent attention. This study examines the original Base/Instruct release using its technical report, official configuration and related primary research. It explains token routing, component interactions, MuonClip stabilization, training infrastructure and agentic post-training. Architectural comparisons with DeepSeek-V3 and analytical memory estimates show why sparse activation reduces arithmetic without making trillion-parameter deployment inexpensive. Reported benchmark scores are distinguished from independent measurements; no training or inference experiment is claimed. The central conclusion is that K2's advantages arise from coordinated architecture, optimization, data and systems choices, rather than parameter count alone.
+\end{abstract}
+\begin{IEEEkeywords}
+Kimi K2, mixture of experts, latent attention, MuonClip, language models, agentic AI
+\end{IEEEkeywords}
+
+\section{Model Overview and Scope}
+Moonshot AI released Kimi-K2-Base as a foundation checkpoint and Kimi-K2-Instruct for chat and agentic applications~\cite{repo}. This report studies that original 128K-context release, not later updated or thinking variants. The technical report's architecture table gives approximately 1.04 trillion total parameters and 32.6 billion activated per token~\cite{k2}; the release overview rounds these to 1T and 32B~\cite{repo}. Keeping those conventions separate avoids an apparent specification conflict.
+
+The model is a causal Transformer. Attention communicates across token positions, whereas feed-forward experts transform individual token representations. These are complementary operations: selecting a different expert does not replace the need to read preceding context. Residual connections carry information around both transformations, allowing the next layer to refine rather than reconstruct the representation.
+
+\begin{table}[t]
+\caption{Original K2 release specifications~\cite{repo,config}.}
+\centering\small
+\begin{tabular}{lr}\toprule
+Quantity & Value\\\midrule
+Layers / dense prefix & 61 / 1\\
+Hidden width / expert width & 7168 / 2048\\
+Routed / active experts & 384 / 8\\
+Shared experts per layer & 1\\
+Attention heads & 64\\
+KV latent rank / query latent rank & 512 / 1536\\
+QK content / rotary / value widths & 128 / 64 / 128\\
+Vocabulary / maximum positions & 163840 / 131072\\\bottomrule
+\end{tabular}
+\label{tab:spec}
+\end{table}
+
+\section{Mixture-of-Experts Computation}
+\subsection{Routing and Expert Organization}
+K2 uses one initial dense feed-forward layer followed by MoE layers. Its configuration specifies sigmoid routing, normalized top-eight weights, one expert group and a routed scaling factor of 2.827~\cite{config}. Group count one means that selection is not constrained by multiple expert groups. This is distinct from placing experts on different physical devices.
+
+Using the bias-adjusted selection pattern described for DeepSeek-V3~\cite{v3}, a compact explanatory routing formulation is
+\begin{align}
+s_i &= \sigma(e_i^\top h),\quad
+\mathcal{S}(h)=\operatorname{TopK}_i(s_i+b_i,8),\\
+g_i &= \frac{s_i\,\mathbf{1}[i\in\mathcal{S}(h)]}
+{\sum_{j\in\mathcal{S}(h)}s_j},\\
+\operatorname{MoE}(h)&=E_{\rm shared}(h)+r\sum_{i\in\mathcal{S}(h)}g_iE_i(h).
+\end{align}
+Here $h$ is a token representation, $e_i$ is a learned routing vector, $b_i$ adjusts selection load and $r$ scales routed output. Selection bias and mixture weight have different roles: changing selection preference need not change the underlying affinity used to weight selected experts. Equations show the expert transformation; the Transformer adds its residual separately.
+
+\begin{figure}[t]
+\centering\small
+\fbox{\begin{tabular}{c}
+Token embeddings and causal context\\$\downarrow$\\
+RMSNorm $\rightarrow$ MLA $\rightarrow$ residual addition\\$\downarrow$\\
+RMSNorm $\rightarrow$ router scores\\
+$\swarrow$\hspace{2cm}$\searrow$\\
+Shared expert\hspace{0.5cm}Eight selected routed experts\\
+$\searrow$\hspace{2cm}$\swarrow$\\
+Weighted combination and residual addition\\$\downarrow$\\
+Next block $\rightarrow$ output vocabulary logits
+\end{tabular}}
+\caption{Conceptual MoE block interaction, redrawn from release specifications~\cite{repo,config}. The first feed-forward block is dense.}
+\end{figure}
+
+The experts use gated feed-forward computation, summarized as $E(h)=W_d[\operatorname{SiLU}(W_gh)\odot W_uh]$. The gate and up projections expand features; elementwise multiplication modulates them before the down projection restores hidden width. The shared expert processes every token, while routing distributes the other transformations among specialists.
+
+\subsection{Capacity versus Activated Arithmetic}
+The routed fraction is $8/384=1/48$, or about 2.08\%. This fraction applies to routed experts, not all parameters: attention, shared experts and embeddings still contribute. As an analytical count, an expert with three bias-free matrices contains roughly $3dm=44.04$ million weights for $d=7168,m=2048$. Selecting eight uses about 352.3 million routed weights in that layer, although all 384 experts provide about 16.91 billion weights of capacity. This calculation explains the sparse trade-off without treating activated parameters as the deployment storage requirement.
+
+\section{Attention and Long-Context Processing}
+\subsection{Multi-Head Latent Attention}
+MLA jointly compresses keys and values, while a separate rotary component carries position information~\cite{v2}. A simplified representation is
+\begin{equation}
+c_t=W_{DKV}h_t,\quad k_{t,i}^{C}=W_{UK,i}c_t,\quad
+v_{t,i}^{C}=W_{UV,i}c_t.
+\end{equation}
+The full key joins content and positional components: $k_{t,i}=[k_{t,i}^{C};k_t^R]$. Causal attention for head $i$ uses
+\begin{equation}
+o_{t,i}=\sum_{j\leq t}
+\operatorname{softmax}_j\!\left(\frac{q_{t,i}^{\top}k_{j,i}}
+{\sqrt{d_C+d_R}}\right)v_{j,i}^{C}.
+\end{equation}
+Content projection matrices can be absorbed into adjacent operations at inference; the cached state can then be the compact latent and shared rotary key rather than expanded per-head keys and values~\cite{v2}. This is not simply fewer attention heads or grouped-query attention.
+
+Using K2's configuration~\cite{config}, an illustrative two-byte cache occupies $L(d_c+d_R)T\times2$ bytes for $L=61,d_c=512,d_R=64$ and sequence length $T$. At $T=131072$, this is approximately 8.58 GiB per sequence. This author-derived estimate assumes a compressed-cache implementation and excludes padding, allocator overhead and additional runtime buffers. It is not a measured server memory figure.
+
+MLA reduces cache storage; it does not make unrestricted attention linear in context length. A straightforward full prefill still involves quadratic token-pair interactions. During decoding, a new query attends to the prefix, so longer histories still increase work and memory traffic. Batch size and concurrent requests multiply cache demand even when model weights are shared.
+
+\subsection{Position Scaling and Context Limits}
+The checkpoint specifies YaRN scaling by 32 from an original 4096-position setting to a 131072-position limit~\cite{config}. YaRN extends rotary-position representations through adjusted frequency scaling and attention-temperature treatment~\cite{yarn}. Positional extrapolation addresses representational range, whereas MLA addresses cache cost; neither mechanism by itself proves accurate retrieval at every position.
+
+A declared context window is therefore a supported input-length envelope, not a promise that every fact in a long document is equally recoverable. For agentic workloads, tool descriptions, tool outputs and previous actions compete for that envelope. Evaluation should separately test usable context, latency and factual grounding rather than reporting maximum length alone.
+
+\section{Training Methodology and Stability}
+The report describes 15.5T pretraining tokens spanning web text, code, mathematics and knowledge, including fidelity-checked rephrasing. Initial training used 4096-token sequences, MuonClip and a warmup--stable--decay schedule; later stages activated longer context and YaRN extension. Training used H800 nodes with eight GPUs and 2 TB host RAM, 16-way pipeline and expert parallelism, and ZeRO-1 data parallelism. Selective recomputation, activation offload and FP8 storage of selected activations reduced memory pressure; FP8 computation was not used in that pretraining recipe~\cite{k2}.
+
+Muon applies matrix-oriented momentum orthogonalization, approximated using Newton--Schulz iterations. Its scalable formulation includes weight decay and consistent update scaling~\cite{muon}. One abstract update is
+\begin{equation}
+M_t=\mu M_{t-1}+G_t,\quad
+W_{t+1}=W_t-\eta(\alpha\,\operatorname{Orth}(M_t)+\lambda W_t),
+\end{equation}
+where $G_t$ is the gradient, $\mu$ momentum, $\eta$ learning rate, $\lambda$ decay and $\alpha$ an update-scale factor. Orthogonalization changes the geometry of matrix updates; it is not ordinary elementwise adaptive normalization.
+
+K2's MuonClip adds post-update query/key weight rescaling when a head's maximum attention logit exceeds a threshold~\cite{blog}. In a simplified unshared Q/K pair, let $\gamma=\min(1,\tau/S_{\max})$. Scaling both projections by $\sqrt{\gamma}$ scales their dot product by $\gamma$. MLA needs head-aware treatment because some positional components are shared: the report scales head-specific content components and rotary queries, leaving the shared rotary key untouched~\cite{k2}.
+
+This distinction matters: clipping projection weights controls subsequent score growth, whereas clipping activations would change the current forward operation. Stability does not establish final task quality; optimization and held-out evaluation remain separate questions.
+
+Post-training combines supervised tool-use trajectories with reinforcement learning in real and simulated environments. Verifiable tasks supply objective rewards, while rubric-based self-critique addresses open-ended judgments~\cite{blog}. In analysis, these stages teach when and how to act; MoE capacity alone does not create a reliable external tool interface. A deployment must still supply schemas, execution permissions, feedback and stopping conditions.
+
+\section{Comparison, Performance and Deployment}
+\begin{table}[t]
+\caption{Structural comparison from primary reports~\cite{k2,v3}. Counts use report precision rather than release rounding.}
+\centering\small
+\begin{tabular}{lrr}\toprule
+Quantity & Kimi K2 & DeepSeek-V3\\\midrule
+Total parameters & 1.04T & 671B\\
+Active parameters & 32.6B & 37B\\
+Layers / dense layers & 61 / 1 & 61 / 3\\
+Routed experts / selected & 384 / 8 & 256 / 8\\
+Shared experts / heads & 1 / 64 & 1 / 128\\
+Attention & MLA & MLA\\
+Expert grouping & No & Yes\\\bottomrule
+\end{tabular}
+\label{tab:comparison}
+\end{table}
+
+Table~\ref{tab:comparison} shows capacity and activated arithmetic moving in different directions. This comparison supports interpreting K2 as a coordinated design point, not the invention of MoE or MLA. DeepSeek-V3 also reports auxiliary-loss-free balancing, multi-token prediction and FP8 mixed-precision training~\cite{v3}; these should not be copied wholesale into claims about K2's training or released inference graph.
+
+The official release reports K2-Instruct scores of 53.7 on LiveCodeBench v6, 65.8 for single-attempt agentic SWE-bench Verified and 75.1 on GPQA-Diamond~\cite{repo}. These are publisher-reported task-specific metrics, not this study's experiments. SWE-bench performance depends on the agent scaffold, available tools and attempt budget. Comparing a single attempt with multiple sampled attempts would confound model quality and test-time compute. No universal throughput conclusion follows from these scores.
+
+For storage, the simple bound $M_w\approx Pb/8$ uses parameter count $P$ and bits per weight $b$. With $P\approx1.04\times10^{12}$, BF16 weights alone require about 2.08 TB in decimal units, FP8 about 1.04 TB and idealized four-bit packing about 0.52 TB. Quantization scales, metadata and execution buffers add overhead. These are author-derived arithmetic estimates; they are not claims that every format is officially supported or equally accurate.
+
+Sparse dispatch can reduce expert matrix arithmetic, but distributing experts introduces token-exchange communication and imbalance. Prefill and decode can expose different bottlenecks. A system that fits weights can still fail latency goals because cache traffic, expert transfers or small effective batches dominate. Conversely, increasing batch size may improve device utilization while increasing user-visible waiting time. Scalability must therefore be evaluated on the intended serving configuration.
+
+\section{Conclusion}
+Kimi K2 combines sparse experts, latent attention, MuonClip and agentic post-training to balance capacity, per-token work and training stability. Its architectural lineage is important: established components are adapted and jointly scaled rather than replaced by a wholly unrelated Transformer. The practical implications are lower activated expert computation and compact attention state, accompanied by substantial weight storage and distributed-systems demands. Reliable use still requires workload-specific measurements and grounded evaluation; report-level benchmarks and analytical estimates are not substitutes for deployment evidence.
+
+\begin{thebibliography}{8}
+\bibitem{repo} Moonshot AI, ``Kimi-K2: official model release,'' GitHub, 2025. [Online]. Available: \url{https://github.com/MoonshotAI/Kimi-K2}
+\bibitem{k2} Kimi Team, ``Kimi K2: Open agentic intelligence,'' arXiv:2507.20534, 2025. [Online]. Available: \url{https://arxiv.org/abs/2507.20534}
+\bibitem{config} Moonshot AI, ``Kimi-K2-Instruct configuration,'' Hugging Face, 2025. [Online]. Available: \url{https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/config.json}
+\bibitem{v3} DeepSeek-AI, ``DeepSeek-V3 technical report,'' arXiv:2412.19437, 2024. [Online]. Available: \url{https://arxiv.org/abs/2412.19437}
+\bibitem{v2} DeepSeek-AI, ``DeepSeek-V2: A strong, economical, and efficient mixture-of-experts language model,'' arXiv:2405.04434, 2024.
+\bibitem{yarn} B. Peng, J. Quesnelle, H. Fan, and E. Shippole, ``YaRN: Efficient context window extension of large language models,'' arXiv:2309.00071, 2023.
+\bibitem{muon} J. Liu \emph{et al.}, ``Muon is scalable for LLM training,'' arXiv:2502.16982, 2025.
+\bibitem{blog} Moonshot AI, ``Kimi K2: Open agentic intelligence,'' technical blog, 2025. [Online]. Available: \url{https://moonshotai.github.io/Kimi-K2/}
+\end{thebibliography}
+\end{document}

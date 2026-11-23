@@ -1,0 +1,13 @@
+sample_id,trial,processing_s,prediction,detected_language,peak_allocated_gib
+vctk_p225_002_mic1,1,0.9712878499999533,Ask her to bring these things with her from the store.,English,3.8363680839538574
+vctk_p225_002_mic1,2,0.9722295369999756,Ask her to bring these things with her from the store.,English,3.8363680839538574
+vctk_p225_002_mic1,3,1.007444403000136,Ask her to bring these things with her from the store.,English,3.8363680839538574
+vctk_p229_162_mic1,1,1.0465589369998725,"It's a problem, but it cannot become an excuse.",English,3.8343496322631836
+vctk_p229_162_mic1,2,0.9262186319999728,"It's a problem, but it cannot become an excuse.",English,3.8343496322631836
+vctk_p229_162_mic1,3,0.9305879340001866,"It's a problem, but it cannot become an excuse.",English,3.8343496322631836
+vctk_p237_304_mic1,1,1.2152790049999567,The move was welcomed by the Roman Catholic Church in Scotland.,English,3.836770534515381
+vctk_p237_304_mic1,2,1.218547985999976,The move was welcomed by the Roman Catholic Church in Scotland.,English,3.836770534515381
+vctk_p237_304_mic1,3,1.1070245990001695,The move was welcomed by the Roman Catholic Church in Scotland.,English,3.836770534515381
+vctk_p241_130_mic1,1,0.9603511820000676,The task force continues to be in discussion with both companies.,English,3.836367130279541
+vctk_p241_130_mic1,2,0.9884280960000069,The task force continues to be in discussion with both companies.,English,3.836367130279541
+vctk_p241_130_mic1,3,1.0254223590000038,The task force continues to be in discussion with both companies.,English,3.836367130279541

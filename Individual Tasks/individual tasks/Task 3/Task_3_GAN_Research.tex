@@ -1,0 +1,263 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{amsmath,amssymb,booktabs,graphicx,url}
+\usepackage[hidelinks]{hyperref}
+\newcommand{\E}{\mathbb{E}}
+\title{Generative Adversarial Networks: Mathematical Foundations, Training Dynamics, and Architectural Developments}
+\author{\IEEEauthorblockN{Alaa Boghdady}\IEEEauthorblockA{Cellula AI Internship -- Week 8, Task 3}}
+\begin{document}
+\maketitle
+\begin{abstract}
+Generative adversarial networks learn to synthesize data through competition between a generator and a discriminator. This study develops the underlying probability model, derives the optimal discriminator and Jensen--Shannon objective, and traces gradients through both networks. Four focal papers organize the review: the original GAN, DCGAN, WGAN-GP, and StyleGAN. Conditional GANs and the original Wasserstein formulation provide complementary context. Analytic examples distinguish a distributional equilibrium from practical convergence and explain saturation, oscillation, and missing modes. The architectural comparison separates conditioning, convolutional inductive biases, transport-based objectives, and style-based synthesis rather than treating them as mutually exclusive alternatives. Applications include super-resolution, image translation, medical augmentation, and synthetic records. This is a literature and mathematical study; it reports no newly trained model or independently measured benchmark.
+\end{abstract}
+\begin{IEEEkeywords}
+GAN, adversarial learning, backpropagation, DCGAN, WGAN-GP, StyleGAN
+\end{IEEEkeywords}
+
+\section{Introduction and Study Design}
+Generating a plausible new example requires learning structure beyond assigning an existing example a label. A generator can be regarded as a programmable sampler: simple random input is transformed into a structured observation. The adversarial approach uses a second learned function to provide a training signal instead of requiring an explicit, tractable likelihood for every observation.
+
+The four focal studies are Goodfellow et al.'s original GAN~\cite{gan}, Radford et al.'s DCGAN~\cite{dcgan}, Gulrajani et al.'s WGAN-GP~\cite{gp}, and Karras et al.'s StyleGAN~\cite{style}. They respectively anchor the game formulation, convolutional design, critic regularization, and controllable synthesis. Supporting sources cover conditioning~\cite{cgan}, optimal transport~\cite{wgan}, evaluation~\cite{fid}, and concrete applications~\cite{sr,pix,cycle,med,records}. The derivations and toy calculations below are explanatory analyses, not replications of those papers' experiments.
+
+\section{Probability Model and Notation}
+Let $x\in\mathcal X\subseteq\mathbb R^n$ be an observation and $z\in\mathbb R^d$ a latent vector. A simple prior, such as $p_z=\mathcal N(0,I)$, supplies randomness. A differentiable generator $G_\theta$ with parameters $\theta$ produces $\tilde x=G_\theta(z)$. Its distribution $q=p_g$ is defined by the pushforward
+\begin{equation}
+q(A)=\Pr_{z\sim p_z}\{G_\theta(z)\in A\}
+\end{equation}
+for measurable sets $A$. This definition remains valid even when a convenient image-space density does not exist. The target distribution is $p=p_{\rm data}$, accessible through training samples. A discriminator $D_\phi(x)=\sigma(a_\phi(x))\in(0,1)$ assigns a real-class probability under the training mixture, with $\sigma(a)=1/(1+e^{-a})$. It is not a calibrated measure of visual quality.
+
+\begin{table}[t]\caption{Symbols used throughout the derivations.}\centering\small
+\begin{tabular}{ll}\toprule
+Symbol & Meaning\\\midrule
+$p,q,p_z$ & Real, generated, and latent distributions\\
+$\theta,\phi$ & Generator and discriminator parameters\\
+$a_\phi,\sigma$ & Discriminator logit and sigmoid\\
+$m,k$ & Batch size and discriminator updates per cycle\\
+$\eta_G,\eta_D$ & Generator and discriminator step sizes\\
+$J_{G,\theta}$ & Jacobian of generated observation w.r.t. $\theta$\\
+$f_\phi$ & Real-valued Wasserstein critic\\
+$\hat x,\lambda$ & Interpolation sample and penalty weight\\
+$c$ & Conditioning information, such as class label\\\bottomrule
+\end{tabular}\end{table}
+
+\begin{figure}[t]\centering
+\fbox{\begin{minipage}{0.92\columnwidth}\centering
+Real batch $x\sim p$ $\longrightarrow$ $D_\phi(x)$\\[5pt]
+Noise $z\sim p_z$ $\longrightarrow$ $G_\theta(z)$ $\longrightarrow$ $D_\phi(G_\theta(z))$\\[5pt]
+Discriminator step: stop gradients at generated images.\\
+Generator step: propagate through $D$ into $G$.
+\end{minipage}}
+\caption{Original conceptual diagram of the two training paths. Freezing discriminator parameters in the generator step does not stop differentiation with respect to its input.}\label{fig:flow}
+\end{figure}
+
+\section{The Adversarial Objective from First Principles}
+\subsection{Binary Classification Becomes a Game}
+With equal weighting of real and fake populations, maximizing binary log likelihood yields
+\begin{align}
+V(G,D)&=\E_{x\sim p}\log D(x)\nonumber\\
+&\quad+\E_{z\sim p_z}\log[1-D(G(z))].\label{eq:value}
+\end{align}
+The original minimax problem is $\min_G\max_D V(G,D)$~\cite{gan}. Real examples reward a large discriminator output; generated examples reward a small output. The generator minimizes the second term to challenge that distinction. In implementation both optimizers usually minimize losses, so $L_D=-V$ and the original generator loss is $L_G^{\rm sat}=\E_z\log(1-D(G(z)))$. A factor of one half in $L_D$ changes only its scale, not its optimum.
+
+\subsection{Optimal Discriminator: Pointwise Derivation}
+Assume $p$ and $q$ have densities with respect to a common dominating measure. For fixed $G$, each location contributes
+\begin{equation}
+\ell(d)=p(x)\log d+q(x)\log(1-d).
+\end{equation}
+At an interior optimum, differentiating gives
+\begin{align}
+\ell'(d)&=\frac{p(x)}d-\frac{q(x)}{1-d}=0,\\
+p(x)(1-d)&=q(x)d,\\
+D^*(x)&=\frac{p(x)}{p(x)+q(x)}.\label{eq:dstar}
+\end{align}
+The second derivative $-p(x)/d^2-q(x)/(1-d)^2$ is negative when $p(x)+q(x)>0$, proving a maximum in the interior. If only one density is nonzero, the optimum is the corresponding boundary limit 1 or 0. Where both vanish, the objective imposes no restriction. This derivation assumes unlimited discriminator capacity and optimization to completion; a finite trained network need not equal $D^*$.
+
+\subsection{Jensen--Shannon Divergence: Every Substitution}
+Define the mixture $r=(p+q)/2$ and
+\begin{equation}
+\mathrm{KL}(u\Vert v)=\int u(x)\log\frac{u(x)}{v(x)}\,dx.
+\end{equation}
+Substitution of (\ref{eq:dstar}) into (\ref{eq:value}) gives
+\begin{align}
+C(G)&=\int p\log\frac{p}{p+q}\,dx+\int q\log\frac{q}{p+q}\,dx\\
+&=\int p\log\frac{p}{2r}\,dx+\int q\log\frac{q}{2r}\,dx\\
+&=\mathrm{KL}(p\Vert r)+\mathrm{KL}(q\Vert r)-2\log2\\
+&=2\mathrm{JS}(p\Vert q)-\log4,\label{eq:js}
+\end{align}
+where $\mathrm{JS}(p\Vert q)=\tfrac12\mathrm{KL}(p\Vert r)+\tfrac12\mathrm{KL}(q\Vert r)$. Each density integrates to one, accounting for the two $\log2$ terms. Nonnegativity of KL implies $C(G)\geq-\log4$. Equality requires $p=q$ almost everywhere. Then $D^*=1/2$ on their support. This is a distributional optimum, not a guarantee that gradient descent reaches it.
+
+\subsection{Equilibrium and an Analytic Example}
+A saddle point of the zero-sum minimax game satisfies
+\begin{equation}
+V(G^*,D)\leq V(G^*,D^*)\leq V(G,D^*)
+\end{equation}
+for all admissible deviations. Neither player improves its own payoff unilaterally. With unrestricted functions and $p=q$, a constant $D^*=1/2$ is such an equilibrium. Neural parameterization introduces nonconvexity and restricted distributions; the ideal theorem alone does not establish convergence for those parameters.
+
+For a two-outcome distribution with $p(1)=0.8$, $q(1)=0.5$, the discriminator formula gives $D^*(1)=8/13$ and $D^*(0)=2/7$. Direct summation yields $\mathrm{JS}(p\Vert q)\approx0.050672$ nats and $C(G)\approx-1.284951$. At $q=p$, JS becomes zero and $C(G)=-1.386294$. These are exact-formula calculations rounded for display, not model performance results.
+
+\section{Forward Pass, Backpropagation, and Updates}
+\subsection{Stable Forward Losses}
+For a batch of $m$ pairs $(x_i,z_i)$, compute $\tilde x_i=G_\theta(z_i)$, logits $a_i^r=a_\phi(x_i)$ and $a_i^f=a_\phi(\tilde x_i)$, and probabilities $s_i^r=\sigma(a_i^r)$, $s_i^f=\sigma(a_i^f)$. Using $\operatorname{softplus}(a)=\log(1+e^a)$, a numerically stable discriminator loss is
+\begin{equation}
+L_D=\frac1m\sum_i[\operatorname{softplus}(-a_i^r)+\operatorname{softplus}(a_i^f)].
+\end{equation}
+A library implementation should evaluate softplus stably rather than forming an overflowing exponential. The frequently used non-saturating generator loss is
+\begin{equation}
+L_G^{\rm ns}=-\frac1m\sum_i\log s_i^f=\frac1m\sum_i\operatorname{softplus}(-a_i^f).
+\end{equation}
+It changes the generator's training objective while preserving the desired distribution-matching fixed point. It should not be described as algebraically identical to the minimax loss.
+
+\subsection{Derivatives at the Discriminator Logits}
+Since $\sigma'(a)=\sigma(a)(1-\sigma(a))$, a real example contributes
+\begin{equation}
+\frac{\partial[-\log\sigma(a)]}{\partial a}=-(1-\sigma(a))=\sigma(a)-1.
+\end{equation}
+A fake example in $L_D$ contributes
+\begin{equation}
+\frac{\partial[-\log(1-\sigma(a))]}{\partial a}=\sigma(a).
+\end{equation}
+Consequently, with the generator held fixed,
+\begin{equation}
+\nabla_\phi L_D=\frac1m\sum_i[(s_i^r-1)\nabla_\phi a_i^r+s_i^f\nabla_\phi a_i^f].
+\end{equation}
+For the generator, the saturating logit derivative is $-s_i^f$; the non-saturating derivative is $s_i^f-1$. Applying the chain rule to the latter gives
+\begin{equation}
+\nabla_\theta L_G^{\rm ns}=\frac1m\sum_i (s_i^f-1)J_{G,\theta}(z_i)^T\nabla_{\tilde x_i}a_\phi(\tilde x_i).\label{eq:chain}
+\end{equation}
+The dimensions are consistent: $J_{G,\theta}$ has one row per generated component and one column per generator parameter; multiplying its transpose by an input-space gradient returns a parameter-space gradient. Backpropagation computes these products without materializing the full Jacobian.
+
+If $s_i^f=0.001$, the saturating coefficient is $-0.001$, whereas the non-saturating coefficient is $-0.999$. The latter avoids this particular small multiplier. It cannot guarantee useful gradients when the discriminator's input gradient or generator Jacobian is uninformative.
+
+\subsection{Alternating Algorithm and Graph Management}
+One outer cycle consists of the following operations.
+\begin{enumerate}
+\item Repeat $k$ discriminator steps. Sample real data and latent noise; compute fake observations and detach them from the generator computation graph.
+\item Clear discriminator gradients; evaluate $L_D$; backpropagate only into $\phi$; update $\phi\leftarrow\phi-\eta_D\nabla_\phi L_D$.
+\item Draw a fresh latent batch. Clear generator gradients and compute new generated observations without detaching them.
+\item Keep discriminator parameters fixed while retaining its input derivatives. Evaluate $L_G^{\rm ns}$ and backpropagate (\ref{eq:chain}).
+\item Update $\theta\leftarrow\theta-\eta_G\nabla_\theta L_G^{\rm ns}$. Record held-out samples and diagnostics; repeat.
+\end{enumerate}
+The subtraction signs assume gradient descent; adaptive optimizers replace the raw step with moment-based updates. Parameters $k$, learning rates, and batch size must be chosen for the model and data. Freezing parameters is distinct from changing training/evaluation mode: batch-normalization statistics and dropout need an explicit policy. Disabling all gradient tracking around $D$ during step 4 would prevent generator learning.
+
+\section{Why Training Can Fail}
+\subsection{Vanishing Gradients and Moving Targets}
+The preceding coefficient calculation explains one saturation mechanism. Near-perfect discrimination can also reflect separated supports: a classifier can distinguish the samples without describing a helpful direction between them. As each player changes, the other's loss landscape moves. A small loss at one step is therefore not sufficient evidence of progress.
+
+\subsection{Oscillation Is a Property of Games}
+Consider the scalar game $\min_a\max_b ab$. Simultaneous gradient updates give $a'=a-\eta b$, $b'=b+\eta a$. Expanding the squared distance to the equilibrium $(0,0)$ gives
+\begin{equation}
+(a')^2+(b')^2=(1+\eta^2)(a^2+b^2).
+\end{equation}
+Thus even this simple game spirals outward for nonzero fixed $\eta$. This analytic counterexample concerns simultaneous updates, not a proof that every alternating GAN update diverges. It illustrates why single-objective descent intuition is insufficient. Two-time-scale theory~\cite{fid} provides conditional local convergence results; those assumptions must not be turned into a universal practical guarantee.
+
+\subsection{Mode Collapse, Memorization, and Diagnostics}
+Mode collapse occurs when many latent inputs generate nearly the same output or a narrow subset of outputs. Mode dropping omits portions of the target distribution. Memorization can produce attractive training copies without generalization. These failures are distinct: sharp images can coexist with missing categories, and varied images can still reproduce private examples.
+
+Practical diagnostics should include fixed-noise sample grids across checkpoints, random samples, class coverage for conditional models, nearest-neighbor comparisons against training data, and evaluation on held-out real data. A discriminator predicting one half can indicate matching distributions, insufficient capacity, or failed optimization. Its loss alone does not distinguish those situations. Changing update ratios, architecture, regularization, or objective should be justified by observed failure rather than a promise that any one method eliminates collapse.
+
+\section{Architectural and Mathematical Developments}
+\subsection{Focal Study 1: Original GAN}
+The original framework~\cite{gan} established adversarial learning and the distributional result derived above. Its non-saturating alternative offers a stronger early logit signal. Its central limitation is the gap between an ideal discriminator optimum and finite, simultaneous neural optimization. The framework is broader than image synthesis: the observation space and differentiable generator determine its possible domains.
+
+\subsection{Focal Study 2: DCGAN}
+DCGAN~\cite{dcgan} develops convolutional design rules for image generation. The discriminator uses strided convolutions, while the generator upsamples using learned convolutional operations. Hidden fully connected stages are removed; batch normalization is used selectively, excluding the generator output and discriminator input. Generator hidden layers use ReLU with a tanh output; discriminator layers use leaky ReLU. These choices provide a spatial inductive bias and improve the practicality of adversarial representation learning. They do not replace the adversarial objective with a new probability divergence or prove convergence.
+
+\subsection{Conditional GANs: An Orthogonal Choice}
+Conditioning~\cite{cgan} supplies information $c$ to both networks:
+\begin{align}
+V_c&=\E_{(x,c)\sim p}\log D(x,c)\nonumber\\
+&\quad+\E_{c,z}\log[1-D(G(z,c),c)].
+\end{align}
+Generated conditions should follow the intended training or sampling distribution. A class embedding, concatenated one-hot label, or image input can carry $c$. Conditioning controls the desired output but does not itself enforce that the generator obeys it. Conditional and convolutional designs can coexist, as can conditioning and a Wasserstein objective.
+
+\subsection{WGAN: Replacing the Distributional Geometry}
+Wasserstein-1 distance~\cite{wgan} measures the least transport cost between distributions:
+\begin{equation}
+W_1(p,q)=\inf_{\gamma\in\Pi(p,q)}\E_{(x,y)\sim\gamma}\|x-y\|_2,
+\end{equation}
+where $\Pi(p,q)$ is the set of joint distributions with marginals $p,q$. Its dual form is
+\begin{equation}
+W_1(p,q)=\sup_{\|f\|_{\rm Lip}\leq1}\big[\E_p f(x)-\E_q f(x)\big].
+\end{equation}
+The critic $f$ outputs a real score, not a sigmoid probability. Minimization losses are $L_f=\E_q f-\E_p f$ and $L_G=-\E_z f(G(z))$. Original weight clipping restricts critic parameters, but is an imperfect way to impose the required function constraint. For point masses $p=\delta_0$, $q=\delta_t$, transport gives $W_1=|t|$, while JS equals $\log2$ whenever $t\ne0$. This example explains the attraction of a distance that changes continuously as the generated point moves.
+
+\subsection{Focal Study 3: WGAN-GP}
+WGAN-GP~\cite{gp} replaces clipping with an input-gradient penalty. Write $\hat x=\epsilon x+(1-\epsilon)\tilde x$, where $\epsilon\sim U[0,1]$ and $\tilde x$ is detached for the critic update. The minimized critic loss is
+\begin{align}
+L_f^{\rm GP}&=\E_q f_\phi(\tilde x)-\E_p f_\phi(x)\nonumber\\
+&\quad+\lambda\E_{\hat x}(\|\nabla_{\hat x}f_\phi(\hat x)\|_2-1)^2.
+\end{align}
+The penalty encourages unit gradient norm along sampled interpolations. It is not a proof of a global 1-Lipschitz bound. Computing its parameter gradient differentiates through an input-gradient operation, so automatic differentiation must retain the appropriate higher-order graph. Batch normalization in the critic couples samples and conflicts with the per-example penalty interpretation; the paper avoids it. The generator loss stays $-\E f(G(z))$. Extra derivative work and penalty tuning remain costs, and improved stability does not imply universal convergence.
+
+\subsection{Focal Study 4: StyleGAN}
+StyleGAN~\cite{style} reorganizes the generator to separate styles and stochastic detail. A mapping network transforms $z$ into $w$; learned affine functions of $w$ provide channel-wise styles to synthesis layers starting from a learned constant. In the first StyleGAN, adaptive instance normalization is
+\begin{equation}
+\operatorname{AdaIN}(h,y)=y_s\frac{h-\mu(h)}{\sigma(h)}+y_b,
+\end{equation}
+with spatial statistics per feature channel. Independent noise maps, scaled by learned coefficients, introduce local variation. Mixing styles from different latent codes across layers encourages control across scales. These mechanisms concern the generator, rather than defining one unique adversarial loss. StyleGAN's mapping and synthesis must not be confused with later StyleGAN2 weight demodulation. Semantic editing remains imperfect; disentanglement is an empirical property, not guaranteed causal independence.
+
+\begin{figure}[t]\centering
+\fbox{\begin{minipage}{0.92\columnwidth}\centering
+$z\ \longrightarrow\ \text{mapping}\ \longrightarrow\ w$\\[4pt]
+$w\ \longrightarrow\ \text{affine styles at several layers}$\\[4pt]
+Learned constant $\longrightarrow$ synthesis layers $\longrightarrow$ image\\[4pt]
+Independent noise maps $\longrightarrow$ synthesis layers
+\end{minipage}}
+\caption{Original schematic of StyleGAN1. Style controls and injected noise follow different paths.}\end{figure}
+
+\begin{table*}[t]\caption{Comparison of the four focal studies and two supporting variants. Categories can be combined; they are not mutually exclusive model classes.}\centering\small
+\begin{tabular}{p{1.5cm}p{3.0cm}p{4.35cm}p{5.9cm}}\toprule
+Method & Principal change & Mathematical/architectural mechanism & Main implication and limitation\\\midrule
+GAN (focal) & Adversarial formulation & Binary discriminator; minimax/non-saturating losses & Learns an implicit sampler; ideal optimum does not guarantee practical convergence.\\
+DCGAN (focal) & Image architecture & Strided convolution, normalization, activation rules & Spatial structure supports image learning; instability and mode dropping can remain.\\
+cGAN & Conditional control & Both networks receive $c$ & Targets classes or inputs; compliance and conditional coverage require evaluation.\\
+WGAN & Distributional objective & Real critic under a Lipschitz constraint & Transport geometry can provide informative signals; weight clipping constrains capacity.\\
+WGAN-GP (focal) & Critic regularization & Input-gradient norm penalty on interpolations & Avoids clipping's particular problems; adds cost and does not enforce a global bound.\\
+StyleGAN (focal) & Synthesis organization & Mapping network, layer styles, separate noise & Enables scale-dependent manipulation; no guarantee of perfect disentanglement.\\\bottomrule
+\end{tabular}\label{tab:compare}\end{table*}
+
+\section{Applications and Appropriate Evidence}
+\subsection{Image Synthesis and Super-Resolution}
+Unconditional synthesis samples images without a specified input; conditional synthesis adds labels or structure. Their success requires both plausible individual examples and broad coverage. In super-resolution, SRGAN~\cite{sr} combines adversarial training with a perceptual content objective. It favors visually plausible texture. A high-frequency detail may be plausible without being the true detail of the original scene; perceptual realism and pixel-level reconstruction are different evaluation targets.
+
+\subsection{Paired and Unpaired Translation}
+Pix2pix~\cite{pix} uses paired input/target images and combines conditional adversarial training with an $L_1$ reconstruction term. Examples include turning structural inputs into images. CycleGAN~\cite{cycle} instead learns two mappings using unpaired domains and cycle consistency, encouraging an input to be recoverable after a round trip. Cycle consistency does not uniquely identify the intended semantic correspondence. The availability of aligned pairs is therefore a modeling decision, not merely a preprocessing detail.
+
+\subsection{Augmentation and Medical Imaging}
+Generated samples can supplement a small or imbalanced training set. Frid-Adar et al.~\cite{med} investigate GAN-based medical image augmentation for liver lesion classification. This is evidence for a specific application setting, not a general claim of clinical benefit. An appropriate independent evaluation would split by patient before training the generator, train classifiers with and without synthetic examples under comparable budgets, and test only on untouched real patients. Synthetic samples must not cross patient partitions or replace assessment of rare pathological patterns.
+
+\subsection{Synthetic Structured Data}
+MedGAN~\cite{records} combines an autoencoder with adversarial generation for discrete patient records. Structured data introduce constraints such as valid categories, cross-field consistency, and rare combinations. Synthetic status alone does not establish privacy. Utility should be checked on downstream tasks and privacy assessed separately; a generator can reproduce training information. No privacy guarantee is inferred from the use of a GAN in this study.
+
+\section{Evaluation and Reproducible Reporting}
+Heusel et al.~\cite{fid} introduce Fr\'echet Inception Distance (FID), comparing Gaussian approximations of real and generated feature distributions. Its common form is
+\begin{align}
+\mathrm{FID}&=\|\mu_r-\mu_g\|_2^2+\operatorname{Tr}\big(\Sigma_r+\Sigma_g\nonumber\\
+&\qquad-2(\Sigma_r^{1/2}\Sigma_g\Sigma_r^{1/2})^{1/2}\big).
+\end{align}
+Here $\mu$ and $\Sigma$ are feature means and covariances. The symmetric square-root expression makes the positive-semidefinite construction explicit. Feature selection, sample count, and preprocessing affect comparisons; a score is not a direct likelihood, memorization test, or clinical validation. Domain-appropriate measures are especially necessary when natural-image features are applied to medical or tabular data.
+
+Reproducible experiments should report data splits, preprocessing, code, seeds, hardware, optimization, training budget, checkpoint selection, and sample selection. Fidelity, coverage, conditioning, and downstream utility require separate assessment.
+
+This submission provides literature analysis and independently worked algebra. No GAN was trained. The numerical examples are analytic illustrations, not benchmarks.
+
+\section{Conclusion}
+GANs replace an explicit likelihood calculation with a learned adversarial signal. The optimal-discriminator derivation explains the original distributional objective, while logit derivatives explain why its practical generator loss is often changed. Alternating updates remain a coupled game whose equilibrium theory differs from convergence in parameter space. DCGAN, WGAN-GP, and StyleGAN address spatial architecture, critic regularization, and synthesis control respectively. Conditioning provides a complementary mechanism. Application success should be established through coverage, fidelity, and task-specific validation rather than visual attractiveness alone.
+
+\begingroup\fontsize{7}{7.5}\selectfont
+\begin{thebibliography}{00}
+\bibitem{gan} I. Goodfellow et al., ``Generative adversarial nets,'' in \emph{Advances in Neural Information Processing Systems}, 2014. \url{https://arxiv.org/abs/1406.2661}.
+\bibitem{dcgan} A. Radford, L. Metz, and S. Chintala, ``Unsupervised representation learning with deep convolutional generative adversarial networks,'' in \emph{ICLR}, 2016. \url{https://arxiv.org/abs/1511.06434}.
+\bibitem{gp} I. Gulrajani, F. Ahmed, M. Arjovsky, V. Dumoulin, and A. Courville, ``Improved training of Wasserstein GANs,'' in \emph{NeurIPS}, 2017. \url{https://arxiv.org/abs/1704.00028}.
+\bibitem{style} T. Karras, S. Laine, and T. Aila, ``A style-based generator architecture for generative adversarial networks,'' in \emph{CVPR}, 2019. \url{https://arxiv.org/abs/1812.04948}.
+\bibitem{cgan} M. Mirza and S. Osindero, ``Conditional generative adversarial nets,'' arXiv:1411.1784, 2014. \url{https://arxiv.org/abs/1411.1784}.
+\bibitem{wgan} M. Arjovsky, S. Chintala, and L. Bottou, ``Wasserstein generative adversarial networks,'' in \emph{ICML}, 2017. \url{https://arxiv.org/abs/1701.07875}.
+\bibitem{fid} M. Heusel et al., ``GANs trained by a two time-scale update rule converge to a local Nash equilibrium,'' in \emph{NeurIPS}, 2017. \url{https://arxiv.org/abs/1706.08500}.
+\bibitem{sr} C. Ledig et al., ``Photo-realistic single image super-resolution using a generative adversarial network,'' in \emph{CVPR}, 2017. \url{https://arxiv.org/abs/1609.04802}.
+\bibitem{pix} P. Isola, J.-Y. Zhu, T. Zhou, and A. A. Efros, ``Image-to-image translation with conditional adversarial networks,'' in \emph{CVPR}, 2017. \url{https://arxiv.org/abs/1611.07004}.
+\bibitem{cycle} J.-Y. Zhu, T. Park, P. Isola, and A. A. Efros, ``Unpaired image-to-image translation using cycle-consistent adversarial networks,'' in \emph{ICCV}, 2017. \url{https://arxiv.org/abs/1703.10593}.
+\bibitem{med} M. Frid-Adar et al., ``GAN-based synthetic medical image augmentation for increased CNN performance in liver lesion classification,'' \emph{Neurocomputing}, vol. 321, pp. 321--331, 2018. \url{https://arxiv.org/abs/1803.01229}.
+\bibitem{records} E. Choi et al., ``Generating multi-label discrete patient records using generative adversarial networks,'' in \emph{Machine Learning for Healthcare}, 2017. \url{https://arxiv.org/abs/1703.06490}.
+\end{thebibliography}\endgroup
+\end{document}
+
+

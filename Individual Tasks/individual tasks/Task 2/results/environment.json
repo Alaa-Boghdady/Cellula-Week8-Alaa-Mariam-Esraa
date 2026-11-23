@@ -1,0 +1,39 @@
+{
+  "python": "3.13.16 (main, Oct  1 2026, 15:40:24) [GCC 13.3.0]",
+  "platform": "Linux-6.6.159+-x86_64-with-glibc2.39",
+  "torch": "2.14.1+cu130",
+  "cuda": "13.0",
+  "gpu": "Tesla T4",
+  "gpu_total_gib": 14.56317138671875,
+  "dtype": "torch.bfloat16",
+  "seed": 42,
+  "packages": {
+    "qwen-asr": "0.0.6",
+    "transformers": "4.57.6",
+    "datasets": "4.8.5",
+    "soundfile": "0.14.0",
+    "librosa": "0.11.0",
+    "jiwer": "4.0.0",
+    "pandas": "2.2.3"
+  },
+  "model_id": "Qwen/Qwen3-ASR-1.7B",
+  "model_revision": "7278e1e70fe206f11671096ffdd38061171dd6e5",
+  "model_load_s": 85.64805647400004,
+  "load_peak_allocated_gib": 4.375771999359131,
+  "max_new_tokens": 512,
+  "language_hint": null,
+  "verified_accent_labels": [
+    "English",
+    "Scottish"
+  ],
+  "accent_coverage_complete": true,
+  "sample_count": 16,
+  "unique_speakers": 10,
+  "repeats": 3,
+  "normalization": "NFC, casefold, punctuation/symbol -> spaces, collapse whitespace; CER includes spaces",
+  "measurement_note": "latency excludes load/download; warmup excluded; peak allocated GPU process memory",
+  "accent_label_qualification": "Dataset-documented labels; not independent linguistic assessment",
+  "accent_extension_gpu": "Tesla T4",
+  "accent_extension_repeats": 3,
+  "accent_extension_note": "Four additional VCTK speakers; two per labelled accent. Convenience sample, not a controlled causal accent comparison."
+}

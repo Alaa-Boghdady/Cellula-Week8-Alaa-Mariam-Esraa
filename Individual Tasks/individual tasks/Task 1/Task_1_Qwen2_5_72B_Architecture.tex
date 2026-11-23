@@ -1,0 +1,170 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{amsmath,amssymb,booktabs,url}
+\usepackage[hidelinks]{hyperref}
+\title{Qwen2.5-72B Architecture: Dense Transformer Design, Training, and Inference Trade-offs}
+\author{\IEEEauthorblockN{Alaa Boghdady}\IEEEauthorblockA{Cellula AI Internship -- Week 8, Task 1}}
+\begin{document}
+\maketitle
+\begin{abstract}
+Qwen2.5-72B is a large dense decoder-only language model whose performance reflects the interaction of established Transformer components with improved training data and alignment. This study analyzes its published configuration, grouped-query attention, rotary positions, gated feed-forward layers, normalization and tokenization. Mathematical descriptions connect those components to parameter counts, cache memory and autoregressive computation. The report distinguishes the checkpoint's default 32K positional configuration from its documented 128K long-context deployment, and separates base-model capability from instruction-tuned evaluation. Official comparative results are reviewed without claiming independent experiments. The main finding is that Qwen2.5-72B's contribution is a coordinated improvement in data, training and usability rather than a new attention mechanism; its substantial dense-weight and long-context memory costs remain central deployment constraints.
+\end{abstract}
+\begin{IEEEkeywords}
+Qwen2.5, dense Transformer, grouped-query attention, SwiGLU, tokenization, inference efficiency
+\end{IEEEkeywords}
+
+\section{Model Overview and Scope}
+Qwen2.5-72B belongs to Alibaba's Qwen family. The public release includes Base and Instruct checkpoints; the latter is post-trained for conversational use. Its model card reports approximately 72.7B parameters, 80 layers, grouped-query attention (GQA), RoPE, SwiGLU, RMSNorm and attention QKV biases~\cite{card}. This analysis concerns the general text-only 72B model, not Qwen2.5-VL, Coder, Math or proprietary API variants.
+
+The model is \emph{dense}: each token uses the feed-forward transformation in every layer rather than selecting a sparse subset of experts. Attention is \emph{causal}: position $t$ can depend on earlier positions and itself, but not later tokens. These distinctions determine both the mathematical training objective and the relationship between parameter count and runtime work.
+
+\begin{table}[t]
+\caption{Checkpoint configuration~\cite{config} and release specification~\cite{card}.}
+\centering\small
+\begin{tabular}{lr}\toprule
+Quantity & Value\\\midrule
+Layers / hidden width & 80 / 8192\\
+FFN intermediate width & 29568\\
+Query heads / key-value heads & 64 / 8\\
+Head width (derived) & 128\\
+Configured vocabulary entries & 152064\\
+RMSNorm epsilon / RoPE base & $10^{-6}$ / $10^6$\\
+Tied input/output embeddings & No\\
+Default maximum positions & 32768\\
+Documented long-context / output & 131072 / 8192\\\bottomrule
+\end{tabular}
+\label{tab:spec}
+\end{table}
+
+\section{Transformer Design and Mathematics}
+\subsection{Autoregressive Objective and Residual Blocks}
+For token sequence $x_{1:T}$, a causal language model factorizes
+\begin{equation}
+p_\theta(x_{1:T})=\prod_{t=1}^{T}p_\theta(x_t\mid x_{<t}),\qquad
+\mathcal{L}=-\sum_t\log p_\theta(x_t\mid x_{<t}).
+\end{equation}
+The loss trains next-token prediction; it does not directly guarantee truthfulness or successful tool execution. In generation, each sampled or selected token becomes part of the next conditioning prefix. Errors can consequently propagate through an otherwise well-formed response.
+
+The pre-normalized block can be summarized as
+\begin{align}
+u_\ell &= h_\ell+\operatorname{Attn}(\operatorname{RMSNorm}(h_\ell)),\\
+h_{\ell+1}&=u_\ell+\operatorname{FFN}(\operatorname{RMSNorm}(u_\ell)).
+\end{align}
+Residual paths preserve the previous representation while attention mixes context and the FFN transforms features. RMSNorm scales by root-mean-square magnitude without LayerNorm's mean subtraction~\cite{rms}:
+\begin{equation}
+\operatorname{RMSNorm}(h)=g\odot\frac{h}
+{\sqrt{d^{-1}\sum_{i=1}^{d}h_i^2+\epsilon}}.
+\end{equation}
+The learned vector $g$ restores feature-wise scaling. This normalization controls representation scale, while residual connections provide a direct information and gradient route; the two mechanisms have different roles.
+
+\begin{figure}[t]
+\centering\small
+\fbox{\begin{tabular}{c}
+Byte-level BPE tokens $\rightarrow$ embeddings\\$\downarrow$\\
+RMSNorm $\rightarrow$ causal GQA with RoPE\\$\downarrow$\\
+Residual addition\\$\downarrow$\\
+RMSNorm $\rightarrow$ dense SwiGLU FFN\\$\downarrow$\\
+Residual addition $\rightarrow$ next block\\$\downarrow$\\
+After 80 blocks: RMSNorm and output head\\$\downarrow$\\
+Vocabulary logits $\rightarrow$ next token
+\end{tabular}}
+\caption{Conceptual component flow, redrawn from release specifications~\cite{card,config}. Repetition applies to the Transformer block, not tokenization.}
+\end{figure}
+
+\subsection{Grouped-Query Attention}
+GQA shares each key/value head across several query heads, forming a compromise between multi-head attention (MHA) and multi-query attention (MQA)~\cite{gqa}. For zero-based query head $i$, let $g(i)=\lfloor i/8\rfloor$ in the 64-query/eight-KV configuration. Then
+\begin{equation}
+O_i=\operatorname{softmax}\!\left(
+\frac{Q_iK_{g(i)}^\top}{\sqrt{128}}+M\right)V_{g(i)},
+\end{equation}
+where $M$ masks future positions. Query and key projections receive rotary position transforms before scoring. Concatenated head outputs are projected back to hidden width.
+
+The eightfold reduction in distinct KV heads reduces cache entries relative to 64-head MHA at equal head width. It does \emph{not} divide all attention computation by eight, because 64 query heads still produce scores. Likewise, sharing keys and values does not mean groups are independent models or routed experts.
+
+\subsection{Rotary Positions and Gated Feed-Forward Layers}
+RoPE encodes position by rotations in paired feature dimensions~\cite{rope}. With position $t$ and frequency $\omega_k$, one pair is transformed as
+\begin{equation}
+R_{t,k}=\begin{bmatrix}\cos(t\omega_k)&-\sin(t\omega_k)\\
+\sin(t\omega_k)&\cos(t\omega_k)\end{bmatrix}.
+\end{equation}
+The identity $R_t^\top R_s=R_{s-t}$ connects the attention dot product to relative displacement. Position information therefore changes similarity scores rather than requiring a separate learned embedding at every possible position.
+
+SwiGLU uses a learned gate and two parallel expansions~\cite{glu}:
+\begin{equation}
+\operatorname{FFN}(h)=W_d\!\left[
+\operatorname{SiLU}(W_gh)\odot W_uh\right],\qquad
+\operatorname{SiLU}(z)=z\sigma(z).
+\end{equation}
+The first two matrices map 8192 features to 29568; the final matrix restores width. Multiplicative gating can select useful feature combinations without explicit expert routing. For this configuration, the bias-free FFN matrices contain $3dm\approx726.66$ million weights per layer, illustrating why the dense FFN is a major parameter and arithmetic contributor.
+
+\section{Tokenization and Context Extension}
+The technical report describes byte-level byte-pair encoding with 151643 regular tokens and 22 control tokens~\cite{report}. The model's configured vocabulary matrix has 152064 rows~\cite{config}; regular-token count, control-token count and matrix allocation are different quantities and should not be equated. Token boundaries are also not word boundaries: punctuation, source code and multilingual text can tokenize differently, changing sequence length and cost.
+
+For Instruct usage, role markers and the chat template are part of formatting the model input, not just visual presentation. The official example applies the tokenizer's chat template before generation~\cite{card}. Using a plain prompt while expecting chat behavior can change the distribution of prefixes supplied to the same weights.
+
+The original configuration has \texttt{max\_position\_embeddings=32768} and disables sliding-window attention~\cite{config}. The model card documents YaRN factor-four scaling for inputs beyond 32768 positions~\cite{card}. YaRN is a rotary-context extension method~\cite{yarn}; setting a larger serving limit without the corresponding positional treatment is not equivalent to the documented long-context deployment.
+
+This distinction reconciles the advertised 131072-token window with the default configuration rather than treating either number as erroneous. The 8192-token generation specification is separate from the total context budget: prompt and generated tokens together occupy the running sequence. Maximum length also does not establish uniform factual retrieval or reliable reasoning across all positions.
+
+\section{Training Methodology and Optimization}
+The Qwen2.5 report describes a family-level corpus expanded from 7T to 18T tokens, improved quality filtering, domain rebalancing and stronger code/math data. Scaling-law experiments guide batch size and learning-rate choice. Dense-model context training progresses from 4096 to 32768 tokens while increasing the RoPE base. Post-training uses over one million SFT examples, followed by offline DPO and online GRPO. Reported SFT uses two epochs, 32768-token sequences, learning-rate decay from $7\times10^{-6}$ to $7\times10^{-7}$, weight decay 0.1 and gradient clipping at 1.0~\cite{report}.
+
+These stages optimize different behavior. Pretraining fits the general next-token distribution; SFT demonstrates desired responses; preference learning changes relative likelihoods of candidate answers. DPO operates on preferred/dispreferred pairs, whereas online policy optimization requires generated responses and reward signals. It would be misleading to describe this entire process as supervised next-token training alone.
+
+The public sources are not a complete 72B training-run log. Exact GPU counts, wall-clock budgets or unreported optimizer settings should not be inferred from parameter count or copied from another variant. Family-level data descriptions are distinct from checkpoint-specific execution records.
+
+\section{Inference Efficiency and Resource Requirements}
+\subsection{Parameter and Weight-Memory Estimates}
+Using the published dimensions~\cite{config}, the attention projection weights per layer are approximately
+\begin{equation}
+P_{\rm attn}=2d^2+2d(n_{KV}d_h)\approx150.99\text{M}.
+\end{equation}
+Combining them with the FFN gives about 70.213B weights over 80 blocks. Two untied $152064\times8192$ vocabulary matrices add about 2.491B; together they yield approximately 72.704B before small norm/bias terms, consistent with the rounded 72.7B release figure. This is an author-derived reconstruction, not a downloaded tensor-count audit.
+
+Weight storage scales as $M_w\approx Pb/8$ for precision $b$ bits. At $P\approx72.7$B, two-byte weights alone occupy about 145.4 GB (135.4 GiB), eight-bit weights 72.7 GB and idealized four-bit weights 36.35 GB. Quantization metadata, temporary buffers and caches are additional. Reduced precision changes an implementation's accuracy/performance trade-off; nominal bit width alone does not determine quality or latency.
+
+\subsection{Cache Cost, Complexity and Serving}
+An ordinary GQA KV cache has approximate size
+\begin{equation}
+M_{KV}=2LTn_{KV}d_hs,
+\end{equation}
+where $L=80$, $n_{KV}=8$, $d_h=128$ and $s$ is bytes per stored element. With two-byte cache elements this is 10 GiB for 32768 tokens and 40 GiB for 131072 tokens, per sequence. At the latter length, a hypothetical equal-width 64-KV-head MHA cache would occupy 320 GiB. These analytical figures omit allocator overhead and do not promise that a specific engine fits a given device.
+
+For a conventional full-attention prefill, token-pair attention work grows quadratically with $T$, while dense projections and FFNs process each token. During cached decoding, projections still traverse the dense blocks and each new query reads existing keys/values. Consequently, long prompts, long outputs and concurrent requests stress different parts of the memory and compute budget.
+
+Tensor parallelism partitions matrices across devices but adds communication. Batching and cache-aware scheduling affect throughput and waiting time. Deployment comparisons must state hardware, precision, engine, concurrency, prompt/output lengths and time-to-first-token; an unqualified tokens-per-second figure is insufficient.
+
+\section{Comparisons, Performance and Innovations}
+\begin{table}[t]
+\caption{Publisher-reported Instruct results from the same release comparison~\cite{blog}. Scores are not independent measurements.}
+\centering\small
+\begin{tabular}{lrr}\toprule
+Benchmark & Qwen2-72B & Qwen2.5-72B\\\midrule
+LiveCodeBench (2305--2409) & 32.2 & 55.5\\
+MBPP & 80.2 & 88.2\\
+MATH & 69.0 & 83.1\\\bottomrule
+\end{tabular}
+\label{tab:bench}
+\end{table}
+
+The previous Qwen2-72B configuration already has the same principal layer count, hidden width, FFN width and query/KV-head counts~\cite{prev}. Architectural continuity therefore matters when interpreting Table~\ref{tab:bench}: improved scores cannot simply be explained as more layers or a switch to MoE. The release emphasizes higher-quality data and improved instruction following, structured outputs and long generation~\cite{blog}. GQA, RMSNorm, SwiGLU and RoPE predate Qwen2.5 and should be credited to their primary research.
+
+Against MHA/MQA, GQA offers an explicit cache-sharing compromise~\cite{gqa}; against sparse-expert models, this dense design offers a more uniform per-token execution pattern but does not obtain the same separation between total capacity and activated expert computation. Neither comparison alone determines real latency: different serving engines, devices and workload shapes can reverse practical rankings.
+
+The benchmark table concerns Instruct checkpoints; it is not a base-model comparison. LiveCodeBench results are tied to the named date window and cannot be compared directly with a different benchmark version. The reported improvements are evidence of task performance under the publisher's evaluation setup, not causal proof that any single training ingredient produced the gain.
+
+\section{Conclusion}
+Qwen2.5-72B combines a dense pre-normalized decoder, grouped-query attention, rotary positions and gated feed-forward layers with improved data and alignment. Its mathematical structure explains both its approximate parameter count and the cache savings of eight KV heads. Long-context deployment requires attention to positional configuration and still carries substantial memory costs. A careful analysis separates architectural inheritance, training improvements, documented benchmark outcomes and independent analytical estimates; no model execution or unreported experimental results are claimed here.
+
+\begin{thebibliography}{10}
+\bibitem{card} Qwen Team, ``Qwen2.5-72B-Instruct model card,'' Hugging Face, 2024. [Online]. Available: \url{https://huggingface.co/Qwen/Qwen2.5-72B-Instruct}
+\bibitem{config} Qwen Team, ``Qwen2.5-72B-Instruct configuration,'' Hugging Face. [Online]. Available: \url{https://huggingface.co/Qwen/Qwen2.5-72B-Instruct/blob/main/config.json}
+\bibitem{rms} B. Zhang and R. Sennrich, ``Root mean square layer normalization,'' in \emph{NeurIPS}, 2019, arXiv:1910.07467.
+\bibitem{gqa} J. Ainslie \emph{et al.}, ``GQA: Training generalized multi-query Transformer models from multi-head checkpoints,'' in \emph{EMNLP}, 2023, arXiv:2305.13245.
+\bibitem{rope} J. Su \emph{et al.}, ``RoFormer: Enhanced Transformer with rotary position embedding,'' arXiv:2104.09864, 2021.
+\bibitem{glu} N. Shazeer, ``GLU variants improve Transformer,'' arXiv:2002.05202, 2020.
+\bibitem{report} Qwen Team, ``Qwen2.5 technical report,'' arXiv:2412.15115, 2024.
+\bibitem{yarn} B. Peng, J. Quesnelle, H. Fan, and E. Shippole, ``YaRN: Efficient context window extension of large language models,'' arXiv:2309.00071, 2023.
+\bibitem{blog} Qwen Team, ``Qwen2.5-LLM: Extending the boundary of LLMs,'' Sep. 2024. [Online]. Available: \url{https://qwenlm.github.io/blog/qwen2.5-llm/}
+\bibitem{prev} Qwen Team, ``Qwen2-72B-Instruct configuration,'' Hugging Face, 2024. [Online]. Available: \url{https://huggingface.co/Qwen/Qwen2-72B-Instruct/blob/main/config.json}
+\end{thebibliography}
+\end{document}
